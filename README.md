@@ -17,35 +17,31 @@ If you've got a Mac Studio sitting around, this turns it into a production-grade
 - ✅ **Demo web page** with live timing breakdown
 - ✅ **Tailscale Funnel-ready** so a Mac behind any NAT can serve your cloud app with auto-HTTPS
 
-### Performance (M3 Ultra, 8.3s of audio)
+### Performance (M3 Ultra, 8.3 s of audio)
 
-| Configuration | Lipsync time | Notes |
+| Configuration | Lipsync | Quality |
 |---|---|---|
-| Baseline (naive `cuda→mps`) | **37.4s** | Direct port, no tuning |
-| + Cached face-parse masks | 27.3s | BiSeNet runs once per source frame during warmup |
-| + Pipe frames to ffmpeg (no PNG I/O) | 18.3s | Stream raw BGR → `ffmpeg -f rawvideo` |
-| + batch_size 16 | 17.2s | M3 Ultra has memory to spare |
-| + fp16 VAE | 17.0s | fp16 UNet gave zero gain on MPS |
-| + **CoreML VAE decoder (CPU+GPU)** | 13.4s | 1.6× faster than MPS, 0.02% parity error |
-| + **TAESD tiny AutoEncoder** | 7.3s | Drop-in SD 1.5 VAE replacement; VAE: 6.4s → 0.5s |
-| + **Pure-numpy fast blend** | 5.5s | Skip PIL round-trip; blend: 2.4s → 1.0s |
-| + **15fps render mode** | **4.3s** | 37% fewer UNet calls, minor motion smoothness trade |
+| Baseline (naive `cuda→mps`) | 37.4 s | reference |
+| + mask cache + ffmpeg pipe + batch 16 + fp16 VAE | 17.0 s | reference |
+| + **CoreML VAE (CPU+GPU)** + fast numpy blend | **13.0 s** @ 24 fps | reference (0.02% parity) |
+| + 15 fps render mode | **~8 s** @ 15 fps | reference |
+| + TAESD tiny VAE (opt-in, `MUSETALK_TAESD=1`) | **4.3 s** @ 15 fps | noticeable skin-tone shift in blend region |
 
-**From 37s → 4.3s: 8.7× faster than the naive port, approaching production GPU class.** Add the ElevenLabs TTS (~1.5s for this length) and the end-to-end `/speak` call lands at **~5.9s** for an 8-second reply.
+Production defaults ship the CoreML-VAE path because it's visually identical to the upstream SD VAE. TAESD stays behind an opt-in flag for speed-first scenarios where the 5-8% warm-tone shift in the blended face region is acceptable.
 
-Shorter replies (2-4s of audio) complete in **under 2 seconds end-to-end** including TTS.
+Add ElevenLabs TTS (~1.5 s for this length) and end-to-end `/speak` lands at **~14 s @ 24 fps** or **~9 s @ 15 fps** for an 8-second reply, production quality.
+
+Shorter replies (2–4 s of audio) typically come back in 3–5 seconds end-to-end.
 
 | Phase | Impact | Effort |
 |---|---|---|
-| ✅ A — face-parse mask cache | -9s | 30 min |
-| ✅ B — batch 16 | -1s | 5 min |
-| ✅ C — fp16 VAE | -0.2s | 10 min |
-| ✅ D — CoreML VAE decoder | -3.6s | 2 hr |
-| ✅ E — TAESD drop-in | -6s | 30 min |
-| ✅ F — numpy fast blend | -1.8s | 30 min |
-| ✅ G — 15fps render | -1.2s | 20 min |
-
-**Next milestone** (not yet implemented): ANE-optimized UNet attention via Apple's SplitEinsumAttention pattern. Could cut UNet from ~3.3s → ~1s, putting total end-to-end under **2 seconds** at 24fps. See `ml-stable-diffusion` for prior art.
+| ✅ A — face-parse mask cache | -9 s | 30 min |
+| ✅ B — batch 16 | -1 s | 5 min |
+| ✅ C — fp16 VAE | -0.2 s | 10 min |
+| ✅ D — CoreML VAE decoder | -3.6 s | 2 hr |
+| ✅ E — numpy fast blend | -1.8 s | 30 min |
+| ✅ F — 15 fps render (optional) | -5 s | 20 min |
+| ✅ G — TAESD (opt-in, quality trade) | -3 s | 30 min |
 
 ---
 
