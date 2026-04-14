@@ -33,9 +33,11 @@ import numpy as np
 import requests
 import torch
 import wave
+import struct
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -377,7 +379,7 @@ def prepare_avatar(video_bytes: bytes) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_fps: float | None = None) -> bytes:
+def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_fps: float | None = None, mux_audio: bool = True) -> bytes:
     """Given a prepared avatar and audio bytes, return final mp4 bytes."""
     prof = {}
     _t0 = time.time()
@@ -565,19 +567,164 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_f
         prof["pipe_ms"] = pipe_ms
         prof["ffmpeg_encode_ms"] = int((time.time() - _t) * 1000) - blend_ms - pipe_ms
 
-        final = os.path.join(tmp, "final.mp4")
-        _t = time.time()
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", wav, "-i", silent,
-             "-c:v", "copy", "-c:a", "aac", "-shortest", final],
-            check=True,
-        )
-        prof["ffmpeg_mux_ms"] = int((time.time() - _t) * 1000)
-        with open(final, "rb") as f:
-            mp4 = f.read()
+        if mux_audio:
+            final = os.path.join(tmp, "final.mp4")
+            _t = time.time()
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", wav, "-i", silent,
+                 "-c:v", "copy", "-c:a", "aac", "-shortest", final],
+                check=True,
+            )
+            prof["ffmpeg_mux_ms"] = int((time.time() - _t) * 1000)
+            with open(final, "rb") as f:
+                mp4 = f.read()
+        else:
+            # Caller will supply audio separately (streaming to client)
+            prof["ffmpeg_mux_ms"] = 0
+            with open(silent, "rb") as f:
+                mp4 = f.read()
         prof["total_ms"] = int((time.time() - _t0) * 1000)
         print(f"[profile] {prof}", flush=True)
         return mp4
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def stream_lipsync_frames(avatar: dict, audio_bytes: bytes, batch_size: int = 16,
+                           render_fps: float | None = None, jpeg_quality: int = 85):
+    """Generator yielding the per-frame streaming protocol the companion client
+    expects. Format:
+
+      [1 pad byte][float32 BE fps][uint32 BE total_frames]     (9-byte header)
+      then for each frame:
+          [uint32 BE frame_len][JPEG bytes]
+
+    Frames are emitted as soon as they're blended, so first-frame time can be
+    well under a second even when the full utterance takes several seconds.
+    """
+    tmp = tempfile.mkdtemp(prefix="mt_stream_")
+    try:
+        wav = os.path.join(tmp, "in.wav")
+        with open(wav, "wb") as f:
+            f.write(audio_bytes)
+
+        device = state["device"]
+        pe = state["pe"]
+        unet = state["unet"]
+        vae = state["vae"]
+        whisper = state["whisper"]
+        audio_processor = state["audio_processor"]
+        weight_dtype = state["weight_dtype"]
+        timesteps = state["timesteps"]
+        coreml_vae = state.get("coreml_vae")
+        coreml_batch = state.get("coreml_batch", 16)
+        taesd_mod = state.get("taesd")
+
+        fps = float(render_fps or avatar["fps"])
+        whisper_features, librosa_len = audio_processor.get_audio_feature(wav)
+        whisper_chunks = audio_processor.get_whisper_chunk(
+            whisper_features, device, weight_dtype, whisper, librosa_len,
+            fps=fps, audio_padding_length_left=2, audio_padding_length_right=2,
+        )
+        total_frames = len(whisper_chunks)
+
+        # 9-byte header: 1 pad byte + float32 fps + uint32 totalFrames (big-endian)
+        yield b"\x00" + struct.pack(">f", fps) + struct.pack(">I", total_frames)
+
+        coord_cycle = avatar["coord_list_cycle"]
+        frame_cycle = avatar["frame_list_cycle"]
+        latent_cycle = avatar["input_latent_list_cycle"]
+        mask_cycle = avatar["mask_list_cycle"]
+        crop_box_cycle = avatar["crop_box_list_cycle"]
+
+        gen = datagen(whisper_chunks, latent_cycle, batch_size, 0, device)
+        jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+
+        # Run VAE decode on a worker thread so the main thread can queue the
+        # next UNet batch on MPS while the current batch's VAE runs on CoreML
+        # (CPU+GPU). Roughly 2-3× higher sustained fps than sequential.
+        def _vae_decode(pred_detached) -> np.ndarray:
+            if taesd_mod is not None:
+                x = pred_detached.to(dtype=next(taesd_mod.parameters()).dtype)
+                out = taesd_mod.decode(x).sample.clamp(0, 1)
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                out = out.float().cpu().numpy()
+                out = np.transpose(out, (0, 2, 3, 1))
+                out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                return out[..., ::-1]
+            if coreml_vae is not None and pred_detached.shape[0] <= coreml_batch:
+                B_in = pred_detached.shape[0]
+                pred_np = pred_detached.to(dtype=torch.float32).numpy()
+                if B_in < coreml_batch:
+                    pad = np.zeros((coreml_batch - B_in, *pred_np.shape[1:]), dtype=np.float32)
+                    pred_np = np.concatenate([pred_np, pad], axis=0)
+                out = coreml_vae.predict({"latents": pred_np})["image"][:B_in]
+                out = np.transpose(out, (0, 2, 3, 1))
+                out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                return out[..., ::-1]
+            recon = vae.decode_latents(pred_detached.to(device))
+            if device.type == "mps":
+                torch.mps.synchronize()
+            return recon
+
+        vae_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pending: list[concurrent.futures.Future] = []
+        frame_idx = 0
+
+        def drain_one() -> "generator":  # yields bytes from ONE finished VAE batch
+            nonlocal frame_idx
+            fut = pending.pop(0)
+            recon = fut.result()
+            for res_frame in recon:
+                if frame_idx >= total_frames:
+                    return
+                idx = frame_idx % len(coord_cycle)
+                x1, y1, x2, y2 = coord_cycle[idx]
+                ori = frame_cycle[idx]
+                y2c = min(y2 + EXTRA_MARGIN, ori.shape[0])
+                try:
+                    rs = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2c - y1))
+                except Exception:
+                    frame_idx += 1
+                    continue
+                combined = fast_blend(
+                    ori, rs, [x1, y1, x2, y2c],
+                    mask_cycle[idx], crop_box_cycle[idx],
+                )
+                ok, jpeg = cv2.imencode(".jpg", combined, jpeg_params)
+                if not ok:
+                    frame_idx += 1
+                    continue
+                jpeg_bytes = jpeg.tobytes()
+                yield struct.pack(">I", len(jpeg_bytes)) + jpeg_bytes
+                frame_idx += 1
+
+        try:
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    if frame_idx >= total_frames:
+                        break
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    # Detach + move to CPU off the hot path so VAE worker doesn't
+                    # contend with the next UNet on the GPU.
+                    pred_cpu = pred.detach().to("cpu")
+                    pending.append(vae_exec.submit(_vae_decode, pred_cpu))
+
+                    # Keep pipeline depth at 1: emit frames from the oldest
+                    # pending batch as soon as UNet for this batch is queued.
+                    while len(pending) >= 2:
+                        yield from drain_one()
+
+                # Drain the tail
+                while pending and frame_idx < total_frames:
+                    yield from drain_one()
+        finally:
+            vae_exec.shutdown(wait=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -613,6 +760,11 @@ def health():
 @app.post("/warmup")
 def warmup(req: WarmupReq):
     start = time.time()
+    if req.avatar_key in avatar_cache:
+        return {
+            "status": "already_ready",
+            "timing": {"total_s": round(time.time() - start, 3)},
+        }
     video_bytes = base64.b64decode(req.video_b64)
     avatar_cache[req.avatar_key] = prepare_avatar(video_bytes)
     return {
@@ -710,10 +862,31 @@ def lipsync_stream(req: StreamReq):
             )
         avatar_cache[req.avatar_key] = prepare_avatar(base64.b64decode(req.video_b64))
 
-    mp4 = run_lipsync(avatar_cache[req.avatar_key], base64.b64decode(req.audio_b64))
+    # Stream JPEG frames in the companion client's custom protocol:
+    #   [1 pad][float32 fps][uint32 total][per-frame: uint32 len][JPEG]
+    # This is what components/companion/companion-view.tsx expects. Frames
+    # are emitted as soon as they're blended, so first-frame is <1s even
+    # for longer utterances.
+    audio = base64.b64decode(req.audio_b64)
+    avatar = avatar_cache[req.avatar_key]
+
+    # Default to 12fps: Mac sustains ~22fps production, so a 12fps output
+    # leaves ~80% headroom — the client buffer never drains even across slow
+    # batches. 15fps was borderline (~46% headroom) and caused mid-playback
+    # stalls on occasional variance.
+    stream_fps = float(os.environ.get("MUSETALK_STREAM_FPS", "12"))
+
+    def _gen():
+        for chunk in stream_lipsync_frames(avatar, audio, render_fps=stream_fps):
+            yield chunk
+
     elapsed = round(time.time() - start, 3)
-    return Response(
-        content=mp4,
+    return StreamingResponse(
+        _gen(),
         media_type="application/octet-stream",
-        headers={"X-Timing": f"total_s={elapsed}"},
+        headers={
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-cache, no-store",
+            "X-Timing": f"first_byte_s={elapsed}",
+        },
     )
