@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MuseTalk on Mac — demo</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1114;
+    color: #e6e6e6;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .app {
+    display: grid;
+    grid-template-columns: 1fr 400px;
+    gap: 24px;
+    max-width: 1100px;
+    width: 100%;
+  }
+  video {
+    width: 100%;
+    border-radius: 14px;
+    background: #000;
+    aspect-ratio: 1 / 1;
+    object-fit: cover;
+  }
+  h1 { margin: 0 0 16px; font-size: 20px; font-weight: 600; }
+  textarea {
+    width: 100%;
+    min-height: 110px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid #2a2e36;
+    background: #15181d;
+    color: inherit;
+    font: inherit;
+    resize: vertical;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 10px;
+    border: 0;
+    border-radius: 10px;
+    background: #3d7dfd;
+    color: #fff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { background: #32363e; color: #888; cursor: wait; }
+  select {
+    width: 100%;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: #15181d;
+    color: inherit;
+    border: 1px solid #2a2e36;
+    border-radius: 10px;
+    font: inherit;
+  }
+  .timing {
+    margin-top: 16px;
+    padding: 12px 14px;
+    background: #15181d;
+    border-radius: 10px;
+    border: 1px solid #2a2e36;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    white-space: pre;
+    line-height: 1.45;
+  }
+  .label { color: #7c8089; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .panel > * + * { margin-top: 14px; }
+  .err { background:#3a1f1f; border-color:#6b2e2e; color:#ffb1b1; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div>
+    <video id="v" autoplay loop muted playsinline></video>
+  </div>
+  <div class="panel">
+    <h1>MuseTalk — Mac demo</h1>
+
+    <div>
+      <div class="label">Avatar (rotates per turn)</div>
+      <select id="avatar">
+        <option value="auto">Alternate A / B</option>
+        <option value="demo_a">Talking A</option>
+        <option value="demo_b">Talking B</option>
+      </select>
+    </div>
+
+    <div>
+      <div class="label">Text</div>
+      <textarea id="text" placeholder="Type something for her to say…">Hi there! This is running on a Mac using MuseTalk, with voice from ElevenLabs. How fast did that feel to you?</textarea>
+    </div>
+
+    <button id="go">Speak</button>
+
+    <div id="timing" class="timing">Ready. Pick a voice, type text, press Speak.</div>
+  </div>
+</div>
+
+<script>
+const v = document.getElementById("v");
+const btn = document.getElementById("go");
+const textEl = document.getElementById("text");
+const timingEl = document.getElementById("timing");
+const avatarEl = document.getElementById("avatar");
+
+// Default idle loop — an actual file from the 5-idle set
+v.src = "/media/idle_turn_left.mp4";
+
+let turnCount = 0;
+
+btn.onclick = async () => {
+  const text = textEl.value.trim();
+  if (!text) return;
+  btn.disabled = true;
+  timingEl.classList.remove("err");
+  timingEl.textContent = "Generating…";
+  const wallStart = performance.now();
+
+  let avatar_key = avatarEl.value;
+  if (avatar_key === "auto") {
+    avatar_key = (turnCount++ % 2 === 0) ? "demo_a" : "demo_b";
+  }
+
+  try {
+    const res = await fetch("/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, avatar_key })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    const j = await res.json();
+    const wallMs = Math.round(performance.now() - wallStart);
+
+    // Decode base64 → blob URL and play
+    const bin = atob(j.video_b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const blob = new Blob([bytes], { type: "video/mp4" });
+
+    v.loop = false;
+    v.muted = false;
+    v.src = URL.createObjectURL(blob);
+    v.onended = () => {
+      v.loop = true;
+      v.muted = true;
+      v.src = "/media/idle_turn_left.mp4";
+    };
+    await v.play().catch(() => {});
+
+    const t = j.timing;
+    const audioSec = (j.audio_bytes / 32000).toFixed(2);
+    const speed = (t.lipsync_ms / 1000 / audioSec).toFixed(2);
+    timingEl.textContent =
+      `avatar      : ${avatar_key}\n` +
+      `audio       : ${audioSec}s (${(j.audio_bytes / 1024).toFixed(0)} KB)\n` +
+      `video       : ${(j.video_bytes / 1024).toFixed(0)} KB\n` +
+      `\n` +
+      `elevenlabs  : ${t.tts_ms} ms\n` +
+      `avatar prep : ${t.warmup_ms} ms ${t.warmup_ms < 5 ? "(cached)" : ""}\n` +
+      `musetalk    : ${t.lipsync_ms} ms   (${speed}× realtime)\n` +
+      `server tot. : ${t.total_ms} ms\n` +
+      `client wall : ${wallMs} ms`;
+  } catch (e) {
+    timingEl.classList.add("err");
+    timingEl.textContent = String(e);
+  } finally {
+    btn.disabled = false;
+  }
+};
+</script>
+</body>
+</html>

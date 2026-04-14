@@ -1,0 +1,34 @@
+# Secrets & local env
+.env
+.env.*
+!.env.example
+
+# Python envs
+.venv/
+.venv-lp/
+__pycache__/
+*.pyc
+
+# Model weights (download via download_weights_mac.sh)
+upstream/models/
+
+# Generated outputs, user data, caches
+upstream/results/
+upstream/data/real_idle/
+upstream/data/demo_idles/
+upstream/data/demo_idles_blinky/
+upstream/data/demo_five/
+upstream/data/demo_avatar*.mp4
+upstream/data/demo_avatar.png
+upstream/data/demo_idle_*.mp4
+upstream/data/blink_*.pkl
+upstream/data/audio/demo_tts.wav
+*.pkl
+!upstream/data/*.keep
+
+# LivePortrait (optional companion repo — clone separately if needed)
+liveportrait/
+
+# Temp / ephemeral
+/tmp/
+.DS_Store

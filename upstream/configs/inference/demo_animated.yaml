@@ -1,0 +1,4 @@
+demo:
+  video_path: "data/demo_avatar_idle.mp4"
+  audio_path: "data/audio/demo_tts.wav"
+  result_name: "demo_animated.mp4"
