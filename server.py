@@ -17,6 +17,7 @@ Run from the repository root:
 """
 
 import base64
+import concurrent.futures
 import copy
 import glob
 import os
@@ -419,82 +420,104 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_f
         res_frame_list = []
         pe_ms = unet_ms = vae_ms = 0
         _t = time.time()
-        with torch.no_grad():
-            for whisper_batch, latent_batch in gen:
-                _a = time.time()
-                audio_feat = pe(whisper_batch)
-                latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                if device.type == "mps":
-                    torch.mps.synchronize()
-                pe_ms += int((time.time() - _a) * 1000)
 
-                _a = time.time()
-                coreml_unet = state.get("coreml_unet")
-                coreml_batch_u = state.get("coreml_batch", 16)
-                if coreml_unet is not None and latent_batch.shape[0] <= coreml_batch_u:
-                    B_in = latent_batch.shape[0]
-                    lat_np = latent_batch.detach().to("cpu").to(dtype=torch.float32).numpy()
-                    af_np = audio_feat.detach().to("cpu").to(dtype=torch.float32).numpy()
-                    if B_in < coreml_batch_u:
-                        lat_np = np.concatenate([lat_np, np.zeros((coreml_batch_u - B_in, *lat_np.shape[1:]), dtype=np.float32)], axis=0)
-                        af_np = np.concatenate([af_np, np.zeros((coreml_batch_u - B_in, *af_np.shape[1:]), dtype=np.float32)], axis=0)
-                    ts_np = np.zeros((coreml_batch_u,), dtype=np.int32)
-                    out = coreml_unet.predict({
-                        "sample": lat_np,
-                        "timesteps": ts_np,
-                        "encoder_hidden_states": af_np,
-                    })["predicted_sample"]
-                    pred = torch.from_numpy(out[:B_in]).to(device)
-                else:
+        taesd_mod = state.get("taesd")
+        coreml_vae = state.get("coreml_vae")
+        coreml_batch = state.get("coreml_batch", 16)
+
+        # Helper closures — run VAE decode for a single batch, returning BGR uint8 frames
+        def _vae_coreml(pred_cpu_fp32_np, B_in):
+            if B_in < coreml_batch:
+                pad = np.zeros((coreml_batch - B_in, *pred_cpu_fp32_np.shape[1:]), dtype=np.float32)
+                pred_cpu_fp32_np = np.concatenate([pred_cpu_fp32_np, pad], axis=0)
+            out = coreml_vae.predict({"latents": pred_cpu_fp32_np})["image"][:B_in]
+            out = np.transpose(out, (0, 2, 3, 1))
+            out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+            return out[..., ::-1]  # RGB → BGR
+
+        def _vae_taesd(pred_mps):
+            x = pred_mps.to(dtype=next(taesd_mod.parameters()).dtype)
+            out = taesd_mod.decode(x).sample.clamp(0, 1)
+            if device.type == "mps":
+                torch.mps.synchronize()
+            out = out.float().cpu().numpy()
+            out = np.transpose(out, (0, 2, 3, 1))
+            out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+            return out[..., ::-1]
+
+        # Pipeline the UNet (on MPS) with the CoreML VAE (on CPU+GPU) using a
+        # 1-worker thread pool. While the main thread runs UNet batch N+1,
+        # the worker is decoding batch N. Effective time per batch drops from
+        # sum(UNet, VAE) to max(UNet, VAE).
+        pipeline_ok = coreml_vae is not None and taesd_mod is None and state.get("coreml_unet") is None
+        if pipeline_ok:
+            vae_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            futures: list[tuple[concurrent.futures.Future, int]] = []
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    _a = time.time()
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    pe_ms += int((time.time() - _a) * 1000)
+
+                    _a = time.time()
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    # Move to CPU. This implicitly syncs for THIS tensor only;
+                    # MPS keeps any further queued work running.
+                    pred_np = pred.detach().to("cpu").to(dtype=torch.float32).numpy()
+                    unet_ms += int((time.time() - _a) * 1000)
+
+                    B_in = pred.shape[0]
+                    futures.append((vae_executor.submit(_vae_coreml, pred_np, B_in), B_in))
+
+            _a = time.time()
+            for fut, B_in in futures:
+                recon = fut.result()
+                for r in recon:
+                    res_frame_list.append(r)
+            vae_ms = int((time.time() - _a) * 1000)  # drain time; true overlap hidden in unet_ms
+            vae_executor.shutdown(wait=True)
+        else:
+            # Sequential fallback (TAESD or CoreML UNet paths — those have own trade-offs)
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    _a = time.time()
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                    pe_ms += int((time.time() - _a) * 1000)
+
+                    _a = time.time()
                     pred = unet.model(
                         latent_batch, timesteps, encoder_hidden_states=audio_feat
                     ).sample
                     if device.type == "mps":
                         torch.mps.synchronize()
-                unet_ms += int((time.time() - _a) * 1000)
+                    unet_ms += int((time.time() - _a) * 1000)
 
-                _a = time.time()
-                taesd_mod = state.get("taesd")
-                coreml_vae = state.get("coreml_vae")
-                coreml_batch = state.get("coreml_batch", 16)
-                if taesd_mod is not None:
-                    # TAESD: unscaled latents in, [0,1] RGB out
-                    x = pred.to(dtype=next(taesd_mod.parameters()).dtype)
-                    out = taesd_mod.decode(x).sample
-                    out = out.clamp(0, 1)
-                    if device.type == "mps":
-                        torch.mps.synchronize()
-                    out = out.float().cpu().numpy()  # [B,3,H,W] in [0,1]
-                    out = np.transpose(out, (0, 2, 3, 1))
-                    out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
-                    recon = out[..., ::-1]  # RGB → BGR
-                elif coreml_vae is not None and pred.shape[0] <= coreml_batch:
-                    # Pad batch to fixed size expected by the mlpackage, run on
-                    # CoreML (CPU+GPU), then unpack → BGR uint8.
-                    B_in = pred.shape[0]
-                    pred_fp32 = pred.detach().to("cpu").to(dtype=torch.float32)
-                    if B_in < coreml_batch:
-                        pad = torch.zeros(coreml_batch - B_in, *pred_fp32.shape[1:], dtype=torch.float32)
-                        pred_fp32 = torch.cat([pred_fp32, pad], dim=0)
-                    out = coreml_vae.predict({"latents": pred_fp32.numpy()})["image"]
-                    out = out[:B_in]  # drop padding
-                    # CoreML output: [B, 3, 256, 256] RGB in [0, 1]
-                    # Convert to BGR uint8 [B, 256, 256, 3] to match vae.decode_latents return shape
-                    out = np.transpose(out, (0, 2, 3, 1))  # HWC
-                    out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
-                    recon = out[..., ::-1]  # RGB → BGR
-                else:
-                    recon = vae.decode_latents(pred)
-                    if device.type == "mps":
-                        torch.mps.synchronize()
-                vae_ms += int((time.time() - _a) * 1000)
+                    _a = time.time()
+                    if taesd_mod is not None:
+                        recon = _vae_taesd(pred)
+                    elif coreml_vae is not None and pred.shape[0] <= coreml_batch:
+                        pred_np = pred.detach().to("cpu").to(dtype=torch.float32).numpy()
+                        recon = _vae_coreml(pred_np, pred.shape[0])
+                    else:
+                        recon = vae.decode_latents(pred)
+                        if device.type == "mps":
+                            torch.mps.synchronize()
+                    vae_ms += int((time.time() - _a) * 1000)
 
-                for r in recon:
-                    res_frame_list.append(r)
+                    for r in recon:
+                        res_frame_list.append(r)
+
         prof["unet_vae_ms"] = int((time.time() - _t) * 1000)
         prof["pe_ms"] = pe_ms
         prof["unet_ms"] = unet_ms
         prof["vae_decode_ms"] = vae_ms
+        prof["pipelined"] = pipeline_ok
         prof["frames"] = len(res_frame_list)
 
         # Build output video by piping BGR frames directly into ffmpeg's stdin.
