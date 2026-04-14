@@ -98,6 +98,43 @@ async def lifespan(_app: FastAPI):
         print("[musetalk] VAE → fp16", flush=True)
 
     # UNet fp16 gave no measurable gain on MPS (see Phase C profile); leave off by default.
+    # TAESD (Tiny AutoEncoder) as a drop-in VAE decoder. 22× faster than
+    # SD VAE on MPS (37ms vs 800ms per batch of 16). Quality is very close
+    # for our use case (talking-head lower-face region).
+    taesd = None
+    if os.environ.get("MUSETALK_TAESD", "0") == "1":
+        from diffusers import AutoencoderTiny
+        taesd_dir = "./models/taesd"
+        if os.path.exists(taesd_dir):
+            print("[musetalk] loading TAESD decoder…", flush=True)
+            taesd = AutoencoderTiny.from_pretrained(taesd_dir).to(device).eval()
+            for p in taesd.parameters():
+                p.requires_grad_(False)
+            if device.type in ("mps", "cuda"):
+                taesd = taesd.half()  # TAESD is tiny & robust, fp16 safe
+            print("[musetalk] TAESD ready (fp16)", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_TAESD=1 but {taesd_dir} missing", flush=True)
+
+    # Optional CoreML UNet (CPU+GPU is ~7% faster than MPS, ANE needs attention surgery).
+    coreml_unet = None
+    if os.environ.get("MUSETALK_COREML_UNET", "0") == "1":
+        unet_pkg = f"./models/musetalkV15/unet_b{int(os.environ.get('MUSETALK_COREML_BATCH', '16'))}.mlpackage"
+        if os.path.exists(unet_pkg):
+            cu_name = os.environ.get("MUSETALK_COREML_UNET_UNITS", "CPU_AND_GPU")
+            cu = {
+                "ALL": ct.ComputeUnit.ALL,
+                "CPU_AND_GPU": ct.ComputeUnit.CPU_AND_GPU,
+                "CPU_AND_NE": ct.ComputeUnit.CPU_AND_NE,
+                "CPU_ONLY": ct.ComputeUnit.CPU_ONLY,
+            }[cu_name]
+            print(f"[musetalk] loading CoreML UNet ({cu_name}) from {unet_pkg}…", flush=True)
+            _t = time.time()
+            coreml_unet = ct.models.MLModel(unet_pkg, compute_units=cu)
+            print(f"[musetalk] CoreML UNet loaded in {time.time()-_t:.1f}s", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_COREML_UNET=1 but {unet_pkg} missing", flush=True)
+
     # Phase D: optional CoreML VAE decoder (CPU+GPU is ~1.6× faster than MPS
     # with 0.024% parity error). Requires vae_decoder_b16.mlpackage to exist.
     coreml_vae = None
@@ -146,6 +183,8 @@ async def lifespan(_app: FastAPI):
         timesteps=timesteps,
         coreml_vae=coreml_vae,
         coreml_batch=coreml_batch,
+        coreml_unet=coreml_unet,
+        taesd=taesd,
     )
     print("[musetalk] ready", flush=True)
     yield
@@ -221,6 +260,38 @@ def elevenlabs_tts(text: str, voice_id: str | None = None) -> bytes:
 # ─── helpers ───────────────────────────────────────────────────────────────
 
 EXTRA_MARGIN = 10  # v15 default
+
+
+def fast_blend(image, face, face_box, mask_array, crop_box):
+    """Pure-numpy BGR blend — drop-in for get_image_blending, ~5× faster.
+
+    Skips the PIL round-trip and the BGR/RGB flips. Uses the precomputed
+    mask (alpha 0-255) to composite the generated face region over the
+    original frame within the larger crop box.
+    """
+    x, y, x1, y1 = face_box
+    xs, ys, xe, ye = crop_box
+    xs = max(0, xs); ys = max(0, ys)
+    xe = min(image.shape[1], xe); ye = min(image.shape[0], ye)
+
+    result = image.copy()
+    face_large = result[ys:ye, xs:xe].copy()
+    # Paste generated face into the face_large region
+    dy0, dx0 = y - ys, x - xs
+    fh, fw = face.shape[:2]
+    face_large[dy0:dy0 + fh, dx0:dx0 + fw] = face
+
+    # Resize mask if it doesn't match the crop region (should match by construction)
+    ch, cw = ye - ys, xe - xs
+    if mask_array.shape[:2] != (ch, cw):
+        mask_array = cv2.resize(mask_array, (cw, ch), interpolation=cv2.INTER_LINEAR)
+
+    alpha = mask_array.astype(np.float32) / 255.0
+    alpha = alpha[..., None]  # [H,W,1]
+    orig = result[ys:ye, xs:xe].astype(np.float32)
+    blended = face_large.astype(np.float32) * alpha + orig * (1.0 - alpha)
+    result[ys:ye, xs:xe] = np.clip(blended, 0, 255).astype(np.uint8)
+    return result
 
 
 def _detect_media_kind(data: bytes) -> str:
@@ -305,7 +376,7 @@ def prepare_avatar(video_bytes: bytes) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes:
+def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_fps: float | None = None) -> bytes:
     """Given a prepared avatar and audio bytes, return final mp4 bytes."""
     prof = {}
     _t0 = time.time()
@@ -326,7 +397,10 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
         timesteps = state["timesteps"]
         fp = state["fp"]
 
-        fps = avatar["fps"]
+        # render_fps (if given) overrides the source video's fps — lets us
+        # produce fewer frames per second of audio, trading smoothness for speed.
+        # Source cycle is still 24-25fps; we just sample it at render_fps pace.
+        fps = render_fps if render_fps else avatar["fps"]
         _t = time.time()
         whisper_features, librosa_len = audio_processor.get_audio_feature(wav)
         whisper_chunks = audio_processor.get_whisper_chunk(
@@ -355,17 +429,46 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
                 pe_ms += int((time.time() - _a) * 1000)
 
                 _a = time.time()
-                pred = unet.model(
-                    latent_batch, timesteps, encoder_hidden_states=audio_feat
-                ).sample
-                if device.type == "mps":
-                    torch.mps.synchronize()
+                coreml_unet = state.get("coreml_unet")
+                coreml_batch_u = state.get("coreml_batch", 16)
+                if coreml_unet is not None and latent_batch.shape[0] <= coreml_batch_u:
+                    B_in = latent_batch.shape[0]
+                    lat_np = latent_batch.detach().to("cpu").to(dtype=torch.float32).numpy()
+                    af_np = audio_feat.detach().to("cpu").to(dtype=torch.float32).numpy()
+                    if B_in < coreml_batch_u:
+                        lat_np = np.concatenate([lat_np, np.zeros((coreml_batch_u - B_in, *lat_np.shape[1:]), dtype=np.float32)], axis=0)
+                        af_np = np.concatenate([af_np, np.zeros((coreml_batch_u - B_in, *af_np.shape[1:]), dtype=np.float32)], axis=0)
+                    ts_np = np.zeros((coreml_batch_u,), dtype=np.int32)
+                    out = coreml_unet.predict({
+                        "sample": lat_np,
+                        "timesteps": ts_np,
+                        "encoder_hidden_states": af_np,
+                    })["predicted_sample"]
+                    pred = torch.from_numpy(out[:B_in]).to(device)
+                else:
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    if device.type == "mps":
+                        torch.mps.synchronize()
                 unet_ms += int((time.time() - _a) * 1000)
 
                 _a = time.time()
+                taesd_mod = state.get("taesd")
                 coreml_vae = state.get("coreml_vae")
                 coreml_batch = state.get("coreml_batch", 16)
-                if coreml_vae is not None and pred.shape[0] <= coreml_batch:
+                if taesd_mod is not None:
+                    # TAESD: unscaled latents in, [0,1] RGB out
+                    x = pred.to(dtype=next(taesd_mod.parameters()).dtype)
+                    out = taesd_mod.decode(x).sample
+                    out = out.clamp(0, 1)
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                    out = out.float().cpu().numpy()  # [B,3,H,W] in [0,1]
+                    out = np.transpose(out, (0, 2, 3, 1))
+                    out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                    recon = out[..., ::-1]  # RGB → BGR
+                elif coreml_vae is not None and pred.shape[0] <= coreml_batch:
                     # Pad batch to fixed size expected by the mlpackage, run on
                     # CoreML (CPU+GPU), then unpack → BGR uint8.
                     B_in = pred.shape[0]
@@ -425,7 +528,7 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
             except Exception:
                 continue
             _t2 = time.time()
-            combined = get_image_blending(
+            combined = fast_blend(
                 ori, rs, [x1, y1, x2, y2],
                 mask_cycle[idx], crop_box_cycle[idx],
             )
@@ -523,6 +626,7 @@ class SpeakReq(BaseModel):
     text: str
     avatar_key: str = "demo_a"
     voice_id: str | None = None
+    fps: float | None = None  # override render fps for speed/smoothness tradeoff
 
 
 @app.post("/speak")
@@ -543,7 +647,7 @@ def speak(req: SpeakReq):
     warm_ms = int((time.time() - t_warm) * 1000)
 
     t_lip = time.time()
-    mp4 = run_lipsync(avatar_cache[req.avatar_key], wav_bytes)
+    mp4 = run_lipsync(avatar_cache[req.avatar_key], wav_bytes, render_fps=req.fps)
     lip_ms = int((time.time() - t_lip) * 1000)
 
     return {

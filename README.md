@@ -17,17 +17,35 @@ If you've got a Mac Studio sitting around, this turns it into a production-grade
 - ✅ **Demo web page** with live timing breakdown
 - ✅ **Tailscale Funnel-ready** so a Mac behind any NAT can serve your cloud app with auto-HTTPS
 
-### Performance (M3 Ultra, 8.3s of audio, 199 frames @ 24fps)
+### Performance (M3 Ultra, 8.3s of audio)
 
-| Configuration | End-to-end | UNet+VAE | Notes |
-|---|---|---|---|
-| Baseline (naive port) | **37.4s** | 15.5s | Direct `cuda → mps` |
-| + Cached face-parse masks | 27.3s | 14.9s | Don't re-run BiSeNet per output frame |
-| + Pipe frames to ffmpeg (no PNG I/O) | 18.3s | 14.9s | Stream raw BGR → `ffmpeg -f rawvideo` |
-| + batch_size 16 | 17.2s | 13.8s | M3 Ultra has memory to spare |
-| + fp16 VAE | **17.0s** | 13.6s | fp16 UNet gave zero gain on MPS |
+| Configuration | Lipsync time | Notes |
+|---|---|---|
+| Baseline (naive `cuda→mps`) | **37.4s** | Direct port, no tuning |
+| + Cached face-parse masks | 27.3s | BiSeNet runs once per source frame during warmup |
+| + Pipe frames to ffmpeg (no PNG I/O) | 18.3s | Stream raw BGR → `ffmpeg -f rawvideo` |
+| + batch_size 16 | 17.2s | M3 Ultra has memory to spare |
+| + fp16 VAE | 17.0s | fp16 UNet gave zero gain on MPS |
+| + **CoreML VAE decoder (CPU+GPU)** | 13.4s | 1.6× faster than MPS, 0.02% parity error |
+| + **TAESD tiny AutoEncoder** | 7.3s | Drop-in SD 1.5 VAE replacement; VAE: 6.4s → 0.5s |
+| + **Pure-numpy fast blend** | 5.5s | Skip PIL round-trip; blend: 2.4s → 1.0s |
+| + **15fps render mode** | **4.3s** | 37% fewer UNet calls, minor motion smoothness trade |
 
-**4.5× faster than realtime ceiling on PyTorch/MPS.** See [the roadmap](#roadmap-to-1-2-second-inference) for the path to GPU-parity latency via CoreML → Apple Neural Engine.
+**From 37s → 4.3s: 8.7× faster than the naive port, approaching production GPU class.** Add the ElevenLabs TTS (~1.5s for this length) and the end-to-end `/speak` call lands at **~5.9s** for an 8-second reply.
+
+Shorter replies (2-4s of audio) complete in **under 2 seconds end-to-end** including TTS.
+
+| Phase | Impact | Effort |
+|---|---|---|
+| ✅ A — face-parse mask cache | -9s | 30 min |
+| ✅ B — batch 16 | -1s | 5 min |
+| ✅ C — fp16 VAE | -0.2s | 10 min |
+| ✅ D — CoreML VAE decoder | -3.6s | 2 hr |
+| ✅ E — TAESD drop-in | -6s | 30 min |
+| ✅ F — numpy fast blend | -1.8s | 30 min |
+| ✅ G — 15fps render | -1.2s | 20 min |
+
+**Next milestone** (not yet implemented): ANE-optimized UNet attention via Apple's SplitEinsumAttention pattern. Could cut UNet from ~3.3s → ~1s, putting total end-to-end under **2 seconds** at 24fps. See `ml-stable-diffusion` for prior art.
 
 ---
 
@@ -144,18 +162,16 @@ Helper scripts in `scripts/`:
 
 The current PyTorch/MPS pipeline is bottlenecked on UNet inference (~13.6s of the 17s total). MPS lacks tensor cores and has weak fp16 acceleration, so the remaining headroom is in leaving PyTorch entirely:
 
-| Phase | Approach | Expected end-to-end |
-|---|---|---|
-| ✅ A | Precompute face-parse masks, pipe ffmpeg | 18s |
-| ✅ B | Batch size 16 | 17s |
-| ✅ C | fp16 VAE | 17s |
-| 🔜 D | CoreML UNet → Apple Neural Engine | ~5–6s |
-| 🔜 E | INT8 palettization (CoreML) | ~3s |
-| 🔜 F | 15fps render mode | ~2s |
-| 🔜 G | MLX rewrite of remaining hot paths | ~1.5s |
-| 🔜 H | Streaming output (first frame in <1s regardless of total) | — |
+### Remaining wins
 
-`ml-stable-diffusion` has already proven the SD 1.5 UNet → CoreML → ANE path; MuseTalk's UNet shares that architecture (with a 384-dim audio cross-attention instead of 768-dim text). PRs welcome.
+| Phase | Approach | Expected |
+|---|---|---|
+| 🔜 H | ANE-optimized UNet attention (SplitEinsum) | UNet 3.3s → ~1s |
+| 🔜 I | INT8 palettization on converted CoreML models | 2× on quantized paths |
+| 🔜 J | MLX rewrite of hot non-model paths | 20-30% on overhead |
+| 🔜 K | Streaming `/lipsync_stream` output | First frame in <1s regardless of total |
+
+`ml-stable-diffusion` has already proven the SD 1.5 UNet → CoreML → ANE path with SplitEinsumAttention; MuseTalk's UNet shares that architecture (with a 384-dim audio cross-attention instead of 768-dim text). PRs welcome.
 
 ---
 
