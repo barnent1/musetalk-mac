@@ -32,3 +32,4 @@ liveportrait/
 # Temp / ephemeral
 /tmp/
 .DS_Store
+.claude/
