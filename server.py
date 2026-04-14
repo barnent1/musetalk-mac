@@ -47,6 +47,8 @@ sys.path.insert(0, UPSTREAM)
 
 from transformers import WhisperModel  # noqa: E402
 
+import coremltools as ct  # noqa: E402
+
 from musetalk.utils.audio_processor import AudioProcessor  # noqa: E402
 from musetalk.utils.blending import (  # noqa: E402
     get_image,
@@ -96,6 +98,27 @@ async def lifespan(_app: FastAPI):
         print("[musetalk] VAE → fp16", flush=True)
 
     # UNet fp16 gave no measurable gain on MPS (see Phase C profile); leave off by default.
+    # Phase D: optional CoreML VAE decoder (CPU+GPU is ~1.6× faster than MPS
+    # with 0.024% parity error). Requires vae_decoder_b16.mlpackage to exist.
+    coreml_vae = None
+    coreml_batch = int(os.environ.get("MUSETALK_COREML_BATCH", "16"))
+    if os.environ.get("MUSETALK_COREML_VAE", "0") == "1":
+        mlpkg = f"./models/sd-vae/vae_decoder_b{coreml_batch}.mlpackage"
+        if os.path.exists(mlpkg):
+            cu_name = os.environ.get("MUSETALK_COREML_VAE_UNITS", "CPU_AND_GPU")
+            cu = {
+                "ALL": ct.ComputeUnit.ALL,
+                "CPU_AND_GPU": ct.ComputeUnit.CPU_AND_GPU,
+                "CPU_AND_NE": ct.ComputeUnit.CPU_AND_NE,
+                "CPU_ONLY": ct.ComputeUnit.CPU_ONLY,
+            }[cu_name]
+            print(f"[musetalk] loading CoreML VAE decoder ({cu_name}) from {mlpkg}…", flush=True)
+            _t = time.time()
+            coreml_vae = ct.models.MLModel(mlpkg, compute_units=cu)
+            print(f"[musetalk] CoreML VAE loaded in {time.time()-_t:.1f}s", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_COREML_VAE=1 but {mlpkg} not found; falling back to PyTorch", flush=True)
+
     use_fp16_unet = os.environ.get("MUSETALK_FP16_UNET", "0") == "1"
     if use_fp16_unet and device.type in ("mps", "cuda"):
         unet.model = unet.model.half()
@@ -121,6 +144,8 @@ async def lifespan(_app: FastAPI):
         weight_dtype=weight_dtype,
         fp=fp,
         timesteps=timesteps,
+        coreml_vae=coreml_vae,
+        coreml_batch=coreml_batch,
     )
     print("[musetalk] ready", flush=True)
     yield
@@ -318,18 +343,55 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
 
         gen = datagen(whisper_chunks, latent_cycle, batch_size, 0, device)
         res_frame_list = []
+        pe_ms = unet_ms = vae_ms = 0
         _t = time.time()
         with torch.no_grad():
             for whisper_batch, latent_batch in gen:
+                _a = time.time()
                 audio_feat = pe(whisper_batch)
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                pe_ms += int((time.time() - _a) * 1000)
+
+                _a = time.time()
                 pred = unet.model(
                     latent_batch, timesteps, encoder_hidden_states=audio_feat
                 ).sample
-                recon = vae.decode_latents(pred)
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                unet_ms += int((time.time() - _a) * 1000)
+
+                _a = time.time()
+                coreml_vae = state.get("coreml_vae")
+                coreml_batch = state.get("coreml_batch", 16)
+                if coreml_vae is not None and pred.shape[0] <= coreml_batch:
+                    # Pad batch to fixed size expected by the mlpackage, run on
+                    # CoreML (CPU+GPU), then unpack → BGR uint8.
+                    B_in = pred.shape[0]
+                    pred_fp32 = pred.detach().to("cpu").to(dtype=torch.float32)
+                    if B_in < coreml_batch:
+                        pad = torch.zeros(coreml_batch - B_in, *pred_fp32.shape[1:], dtype=torch.float32)
+                        pred_fp32 = torch.cat([pred_fp32, pad], dim=0)
+                    out = coreml_vae.predict({"latents": pred_fp32.numpy()})["image"]
+                    out = out[:B_in]  # drop padding
+                    # CoreML output: [B, 3, 256, 256] RGB in [0, 1]
+                    # Convert to BGR uint8 [B, 256, 256, 3] to match vae.decode_latents return shape
+                    out = np.transpose(out, (0, 2, 3, 1))  # HWC
+                    out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                    recon = out[..., ::-1]  # RGB → BGR
+                else:
+                    recon = vae.decode_latents(pred)
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                vae_ms += int((time.time() - _a) * 1000)
+
                 for r in recon:
                     res_frame_list.append(r)
         prof["unet_vae_ms"] = int((time.time() - _t) * 1000)
+        prof["pe_ms"] = pe_ms
+        prof["unet_ms"] = unet_ms
+        prof["vae_decode_ms"] = vae_ms
         prof["frames"] = len(res_frame_list)
 
         # Build output video by piping BGR frames directly into ffmpeg's stdin.
