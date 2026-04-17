@@ -17,6 +17,7 @@ Run from the repository root:
 """
 
 import base64
+import concurrent.futures
 import copy
 import glob
 import os
@@ -32,9 +33,11 @@ import numpy as np
 import requests
 import torch
 import wave
+import struct
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -46,6 +49,8 @@ os.chdir(UPSTREAM)
 sys.path.insert(0, UPSTREAM)
 
 from transformers import WhisperModel  # noqa: E402
+
+import coremltools as ct  # noqa: E402
 
 from musetalk.utils.audio_processor import AudioProcessor  # noqa: E402
 from musetalk.utils.blending import (  # noqa: E402
@@ -96,6 +101,64 @@ async def lifespan(_app: FastAPI):
         print("[musetalk] VAE → fp16", flush=True)
 
     # UNet fp16 gave no measurable gain on MPS (see Phase C profile); leave off by default.
+    # TAESD (Tiny AutoEncoder) as a drop-in VAE decoder. 22× faster than
+    # SD VAE on MPS (37ms vs 800ms per batch of 16). Quality is very close
+    # for our use case (talking-head lower-face region).
+    taesd = None
+    if os.environ.get("MUSETALK_TAESD", "0") == "1":
+        from diffusers import AutoencoderTiny
+        taesd_dir = "./models/taesd"
+        if os.path.exists(taesd_dir):
+            print("[musetalk] loading TAESD decoder…", flush=True)
+            taesd = AutoencoderTiny.from_pretrained(taesd_dir).to(device).eval()
+            for p in taesd.parameters():
+                p.requires_grad_(False)
+            if device.type in ("mps", "cuda"):
+                taesd = taesd.half()  # TAESD is tiny & robust, fp16 safe
+            print("[musetalk] TAESD ready (fp16)", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_TAESD=1 but {taesd_dir} missing", flush=True)
+
+    # Optional CoreML UNet (CPU+GPU is ~7% faster than MPS, ANE needs attention surgery).
+    coreml_unet = None
+    if os.environ.get("MUSETALK_COREML_UNET", "0") == "1":
+        unet_pkg = f"./models/musetalkV15/unet_b{int(os.environ.get('MUSETALK_COREML_BATCH', '16'))}.mlpackage"
+        if os.path.exists(unet_pkg):
+            cu_name = os.environ.get("MUSETALK_COREML_UNET_UNITS", "CPU_AND_GPU")
+            cu = {
+                "ALL": ct.ComputeUnit.ALL,
+                "CPU_AND_GPU": ct.ComputeUnit.CPU_AND_GPU,
+                "CPU_AND_NE": ct.ComputeUnit.CPU_AND_NE,
+                "CPU_ONLY": ct.ComputeUnit.CPU_ONLY,
+            }[cu_name]
+            print(f"[musetalk] loading CoreML UNet ({cu_name}) from {unet_pkg}…", flush=True)
+            _t = time.time()
+            coreml_unet = ct.models.MLModel(unet_pkg, compute_units=cu)
+            print(f"[musetalk] CoreML UNet loaded in {time.time()-_t:.1f}s", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_COREML_UNET=1 but {unet_pkg} missing", flush=True)
+
+    # Phase D: optional CoreML VAE decoder (CPU+GPU is ~1.6× faster than MPS
+    # with 0.024% parity error). Requires vae_decoder_b16.mlpackage to exist.
+    coreml_vae = None
+    coreml_batch = int(os.environ.get("MUSETALK_COREML_BATCH", "16"))
+    if os.environ.get("MUSETALK_COREML_VAE", "0") == "1":
+        mlpkg = f"./models/sd-vae/vae_decoder_b{coreml_batch}.mlpackage"
+        if os.path.exists(mlpkg):
+            cu_name = os.environ.get("MUSETALK_COREML_VAE_UNITS", "CPU_AND_GPU")
+            cu = {
+                "ALL": ct.ComputeUnit.ALL,
+                "CPU_AND_GPU": ct.ComputeUnit.CPU_AND_GPU,
+                "CPU_AND_NE": ct.ComputeUnit.CPU_AND_NE,
+                "CPU_ONLY": ct.ComputeUnit.CPU_ONLY,
+            }[cu_name]
+            print(f"[musetalk] loading CoreML VAE decoder ({cu_name}) from {mlpkg}…", flush=True)
+            _t = time.time()
+            coreml_vae = ct.models.MLModel(mlpkg, compute_units=cu)
+            print(f"[musetalk] CoreML VAE loaded in {time.time()-_t:.1f}s", flush=True)
+        else:
+            print(f"[musetalk] MUSETALK_COREML_VAE=1 but {mlpkg} not found; falling back to PyTorch", flush=True)
+
     use_fp16_unet = os.environ.get("MUSETALK_FP16_UNET", "0") == "1"
     if use_fp16_unet and device.type in ("mps", "cuda"):
         unet.model = unet.model.half()
@@ -121,6 +184,10 @@ async def lifespan(_app: FastAPI):
         weight_dtype=weight_dtype,
         fp=fp,
         timesteps=timesteps,
+        coreml_vae=coreml_vae,
+        coreml_batch=coreml_batch,
+        coreml_unet=coreml_unet,
+        taesd=taesd,
     )
     print("[musetalk] ready", flush=True)
     yield
@@ -196,6 +263,38 @@ def elevenlabs_tts(text: str, voice_id: str | None = None) -> bytes:
 # ─── helpers ───────────────────────────────────────────────────────────────
 
 EXTRA_MARGIN = 10  # v15 default
+
+
+def fast_blend(image, face, face_box, mask_array, crop_box):
+    """Pure-numpy BGR blend — drop-in for get_image_blending, ~5× faster.
+
+    Skips the PIL round-trip and the BGR/RGB flips. Uses the precomputed
+    mask (alpha 0-255) to composite the generated face region over the
+    original frame within the larger crop box.
+    """
+    x, y, x1, y1 = face_box
+    xs, ys, xe, ye = crop_box
+    xs = max(0, xs); ys = max(0, ys)
+    xe = min(image.shape[1], xe); ye = min(image.shape[0], ye)
+
+    result = image.copy()
+    face_large = result[ys:ye, xs:xe].copy()
+    # Paste generated face into the face_large region
+    dy0, dx0 = y - ys, x - xs
+    fh, fw = face.shape[:2]
+    face_large[dy0:dy0 + fh, dx0:dx0 + fw] = face
+
+    # Resize mask if it doesn't match the crop region (should match by construction)
+    ch, cw = ye - ys, xe - xs
+    if mask_array.shape[:2] != (ch, cw):
+        mask_array = cv2.resize(mask_array, (cw, ch), interpolation=cv2.INTER_LINEAR)
+
+    alpha = mask_array.astype(np.float32) / 255.0
+    alpha = alpha[..., None]  # [H,W,1]
+    orig = result[ys:ye, xs:xe].astype(np.float32)
+    blended = face_large.astype(np.float32) * alpha + orig * (1.0 - alpha)
+    result[ys:ye, xs:xe] = np.clip(blended, 0, 255).astype(np.uint8)
+    return result
 
 
 def _detect_media_kind(data: bytes) -> str:
@@ -280,7 +379,7 @@ def prepare_avatar(video_bytes: bytes) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes:
+def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16, render_fps: float | None = None, mux_audio: bool = True) -> bytes:
     """Given a prepared avatar and audio bytes, return final mp4 bytes."""
     prof = {}
     _t0 = time.time()
@@ -301,7 +400,10 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
         timesteps = state["timesteps"]
         fp = state["fp"]
 
-        fps = avatar["fps"]
+        # render_fps (if given) overrides the source video's fps — lets us
+        # produce fewer frames per second of audio, trading smoothness for speed.
+        # Source cycle is still 24-25fps; we just sample it at render_fps pace.
+        fps = render_fps if render_fps else avatar["fps"]
         _t = time.time()
         whisper_features, librosa_len = audio_processor.get_audio_feature(wav)
         whisper_chunks = audio_processor.get_whisper_chunk(
@@ -318,18 +420,106 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
 
         gen = datagen(whisper_chunks, latent_cycle, batch_size, 0, device)
         res_frame_list = []
+        pe_ms = unet_ms = vae_ms = 0
         _t = time.time()
-        with torch.no_grad():
-            for whisper_batch, latent_batch in gen:
-                audio_feat = pe(whisper_batch)
-                latent_batch = latent_batch.to(dtype=unet.model.dtype)
-                pred = unet.model(
-                    latent_batch, timesteps, encoder_hidden_states=audio_feat
-                ).sample
-                recon = vae.decode_latents(pred)
+
+        taesd_mod = state.get("taesd")
+        coreml_vae = state.get("coreml_vae")
+        coreml_batch = state.get("coreml_batch", 16)
+
+        # Helper closures — run VAE decode for a single batch, returning BGR uint8 frames
+        def _vae_coreml(pred_cpu_fp32_np, B_in):
+            if B_in < coreml_batch:
+                pad = np.zeros((coreml_batch - B_in, *pred_cpu_fp32_np.shape[1:]), dtype=np.float32)
+                pred_cpu_fp32_np = np.concatenate([pred_cpu_fp32_np, pad], axis=0)
+            out = coreml_vae.predict({"latents": pred_cpu_fp32_np})["image"][:B_in]
+            out = np.transpose(out, (0, 2, 3, 1))
+            out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+            return out[..., ::-1]  # RGB → BGR
+
+        def _vae_taesd(pred_mps):
+            x = pred_mps.to(dtype=next(taesd_mod.parameters()).dtype)
+            out = taesd_mod.decode(x).sample.clamp(0, 1)
+            if device.type == "mps":
+                torch.mps.synchronize()
+            out = out.float().cpu().numpy()
+            out = np.transpose(out, (0, 2, 3, 1))
+            out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+            return out[..., ::-1]
+
+        # Pipeline the UNet (on MPS) with the CoreML VAE (on CPU+GPU) using a
+        # 1-worker thread pool. While the main thread runs UNet batch N+1,
+        # the worker is decoding batch N. Effective time per batch drops from
+        # sum(UNet, VAE) to max(UNet, VAE).
+        pipeline_ok = coreml_vae is not None and taesd_mod is None and state.get("coreml_unet") is None
+        if pipeline_ok:
+            vae_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            futures: list[tuple[concurrent.futures.Future, int]] = []
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    _a = time.time()
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    pe_ms += int((time.time() - _a) * 1000)
+
+                    _a = time.time()
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    # Move to CPU. This implicitly syncs for THIS tensor only;
+                    # MPS keeps any further queued work running.
+                    pred_np = pred.detach().to("cpu").to(dtype=torch.float32).numpy()
+                    unet_ms += int((time.time() - _a) * 1000)
+
+                    B_in = pred.shape[0]
+                    futures.append((vae_executor.submit(_vae_coreml, pred_np, B_in), B_in))
+
+            _a = time.time()
+            for fut, B_in in futures:
+                recon = fut.result()
                 for r in recon:
                     res_frame_list.append(r)
+            vae_ms = int((time.time() - _a) * 1000)  # drain time; true overlap hidden in unet_ms
+            vae_executor.shutdown(wait=True)
+        else:
+            # Sequential fallback (TAESD or CoreML UNet paths — those have own trade-offs)
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    _a = time.time()
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                    pe_ms += int((time.time() - _a) * 1000)
+
+                    _a = time.time()
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                    unet_ms += int((time.time() - _a) * 1000)
+
+                    _a = time.time()
+                    if taesd_mod is not None:
+                        recon = _vae_taesd(pred)
+                    elif coreml_vae is not None and pred.shape[0] <= coreml_batch:
+                        pred_np = pred.detach().to("cpu").to(dtype=torch.float32).numpy()
+                        recon = _vae_coreml(pred_np, pred.shape[0])
+                    else:
+                        recon = vae.decode_latents(pred)
+                        if device.type == "mps":
+                            torch.mps.synchronize()
+                    vae_ms += int((time.time() - _a) * 1000)
+
+                    for r in recon:
+                        res_frame_list.append(r)
+
         prof["unet_vae_ms"] = int((time.time() - _t) * 1000)
+        prof["pe_ms"] = pe_ms
+        prof["unet_ms"] = unet_ms
+        prof["vae_decode_ms"] = vae_ms
+        prof["pipelined"] = pipeline_ok
         prof["frames"] = len(res_frame_list)
 
         # Build output video by piping BGR frames directly into ffmpeg's stdin.
@@ -363,7 +553,7 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
             except Exception:
                 continue
             _t2 = time.time()
-            combined = get_image_blending(
+            combined = fast_blend(
                 ori, rs, [x1, y1, x2, y2],
                 mask_cycle[idx], crop_box_cycle[idx],
             )
@@ -377,19 +567,164 @@ def run_lipsync(avatar: dict, audio_bytes: bytes, batch_size: int = 16) -> bytes
         prof["pipe_ms"] = pipe_ms
         prof["ffmpeg_encode_ms"] = int((time.time() - _t) * 1000) - blend_ms - pipe_ms
 
-        final = os.path.join(tmp, "final.mp4")
-        _t = time.time()
-        subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", wav, "-i", silent,
-             "-c:v", "copy", "-c:a", "aac", "-shortest", final],
-            check=True,
-        )
-        prof["ffmpeg_mux_ms"] = int((time.time() - _t) * 1000)
-        with open(final, "rb") as f:
-            mp4 = f.read()
+        if mux_audio:
+            final = os.path.join(tmp, "final.mp4")
+            _t = time.time()
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", wav, "-i", silent,
+                 "-c:v", "copy", "-c:a", "aac", "-shortest", final],
+                check=True,
+            )
+            prof["ffmpeg_mux_ms"] = int((time.time() - _t) * 1000)
+            with open(final, "rb") as f:
+                mp4 = f.read()
+        else:
+            # Caller will supply audio separately (streaming to client)
+            prof["ffmpeg_mux_ms"] = 0
+            with open(silent, "rb") as f:
+                mp4 = f.read()
         prof["total_ms"] = int((time.time() - _t0) * 1000)
         print(f"[profile] {prof}", flush=True)
         return mp4
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def stream_lipsync_frames(avatar: dict, audio_bytes: bytes, batch_size: int = 16,
+                           render_fps: float | None = None, jpeg_quality: int = 85):
+    """Generator yielding the per-frame streaming protocol the companion client
+    expects. Format:
+
+      [1 pad byte][float32 BE fps][uint32 BE total_frames]     (9-byte header)
+      then for each frame:
+          [uint32 BE frame_len][JPEG bytes]
+
+    Frames are emitted as soon as they're blended, so first-frame time can be
+    well under a second even when the full utterance takes several seconds.
+    """
+    tmp = tempfile.mkdtemp(prefix="mt_stream_")
+    try:
+        wav = os.path.join(tmp, "in.wav")
+        with open(wav, "wb") as f:
+            f.write(audio_bytes)
+
+        device = state["device"]
+        pe = state["pe"]
+        unet = state["unet"]
+        vae = state["vae"]
+        whisper = state["whisper"]
+        audio_processor = state["audio_processor"]
+        weight_dtype = state["weight_dtype"]
+        timesteps = state["timesteps"]
+        coreml_vae = state.get("coreml_vae")
+        coreml_batch = state.get("coreml_batch", 16)
+        taesd_mod = state.get("taesd")
+
+        fps = float(render_fps or avatar["fps"])
+        whisper_features, librosa_len = audio_processor.get_audio_feature(wav)
+        whisper_chunks = audio_processor.get_whisper_chunk(
+            whisper_features, device, weight_dtype, whisper, librosa_len,
+            fps=fps, audio_padding_length_left=2, audio_padding_length_right=2,
+        )
+        total_frames = len(whisper_chunks)
+
+        # 9-byte header: 1 pad byte + float32 fps + uint32 totalFrames (big-endian)
+        yield b"\x00" + struct.pack(">f", fps) + struct.pack(">I", total_frames)
+
+        coord_cycle = avatar["coord_list_cycle"]
+        frame_cycle = avatar["frame_list_cycle"]
+        latent_cycle = avatar["input_latent_list_cycle"]
+        mask_cycle = avatar["mask_list_cycle"]
+        crop_box_cycle = avatar["crop_box_list_cycle"]
+
+        gen = datagen(whisper_chunks, latent_cycle, batch_size, 0, device)
+        jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+
+        # Run VAE decode on a worker thread so the main thread can queue the
+        # next UNet batch on MPS while the current batch's VAE runs on CoreML
+        # (CPU+GPU). Roughly 2-3× higher sustained fps than sequential.
+        def _vae_decode(pred_detached) -> np.ndarray:
+            if taesd_mod is not None:
+                x = pred_detached.to(dtype=next(taesd_mod.parameters()).dtype)
+                out = taesd_mod.decode(x).sample.clamp(0, 1)
+                if device.type == "mps":
+                    torch.mps.synchronize()
+                out = out.float().cpu().numpy()
+                out = np.transpose(out, (0, 2, 3, 1))
+                out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                return out[..., ::-1]
+            if coreml_vae is not None and pred_detached.shape[0] <= coreml_batch:
+                B_in = pred_detached.shape[0]
+                pred_np = pred_detached.to(dtype=torch.float32).numpy()
+                if B_in < coreml_batch:
+                    pad = np.zeros((coreml_batch - B_in, *pred_np.shape[1:]), dtype=np.float32)
+                    pred_np = np.concatenate([pred_np, pad], axis=0)
+                out = coreml_vae.predict({"latents": pred_np})["image"][:B_in]
+                out = np.transpose(out, (0, 2, 3, 1))
+                out = (out * 255.0).round().clip(0, 255).astype(np.uint8)
+                return out[..., ::-1]
+            recon = vae.decode_latents(pred_detached.to(device))
+            if device.type == "mps":
+                torch.mps.synchronize()
+            return recon
+
+        vae_exec = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pending: list[concurrent.futures.Future] = []
+        frame_idx = 0
+
+        def drain_one() -> "generator":  # yields bytes from ONE finished VAE batch
+            nonlocal frame_idx
+            fut = pending.pop(0)
+            recon = fut.result()
+            for res_frame in recon:
+                if frame_idx >= total_frames:
+                    return
+                idx = frame_idx % len(coord_cycle)
+                x1, y1, x2, y2 = coord_cycle[idx]
+                ori = frame_cycle[idx]
+                y2c = min(y2 + EXTRA_MARGIN, ori.shape[0])
+                try:
+                    rs = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2c - y1))
+                except Exception:
+                    frame_idx += 1
+                    continue
+                combined = fast_blend(
+                    ori, rs, [x1, y1, x2, y2c],
+                    mask_cycle[idx], crop_box_cycle[idx],
+                )
+                ok, jpeg = cv2.imencode(".jpg", combined, jpeg_params)
+                if not ok:
+                    frame_idx += 1
+                    continue
+                jpeg_bytes = jpeg.tobytes()
+                yield struct.pack(">I", len(jpeg_bytes)) + jpeg_bytes
+                frame_idx += 1
+
+        try:
+            with torch.no_grad():
+                for whisper_batch, latent_batch in gen:
+                    if frame_idx >= total_frames:
+                        break
+                    audio_feat = pe(whisper_batch)
+                    latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                    pred = unet.model(
+                        latent_batch, timesteps, encoder_hidden_states=audio_feat
+                    ).sample
+                    # Detach + move to CPU off the hot path so VAE worker doesn't
+                    # contend with the next UNet on the GPU.
+                    pred_cpu = pred.detach().to("cpu")
+                    pending.append(vae_exec.submit(_vae_decode, pred_cpu))
+
+                    # Keep pipeline depth at 1: emit frames from the oldest
+                    # pending batch as soon as UNet for this batch is queued.
+                    while len(pending) >= 2:
+                        yield from drain_one()
+
+                # Drain the tail
+                while pending and frame_idx < total_frames:
+                    yield from drain_one()
+        finally:
+            vae_exec.shutdown(wait=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -425,6 +760,11 @@ def health():
 @app.post("/warmup")
 def warmup(req: WarmupReq):
     start = time.time()
+    if req.avatar_key in avatar_cache:
+        return {
+            "status": "already_ready",
+            "timing": {"total_s": round(time.time() - start, 3)},
+        }
     video_bytes = base64.b64decode(req.video_b64)
     avatar_cache[req.avatar_key] = prepare_avatar(video_bytes)
     return {
@@ -461,6 +801,7 @@ class SpeakReq(BaseModel):
     text: str
     avatar_key: str = "demo_a"
     voice_id: str | None = None
+    fps: float | None = None  # override render fps for speed/smoothness tradeoff
 
 
 @app.post("/speak")
@@ -481,7 +822,7 @@ def speak(req: SpeakReq):
     warm_ms = int((time.time() - t_warm) * 1000)
 
     t_lip = time.time()
-    mp4 = run_lipsync(avatar_cache[req.avatar_key], wav_bytes)
+    mp4 = run_lipsync(avatar_cache[req.avatar_key], wav_bytes, render_fps=req.fps)
     lip_ms = int((time.time() - t_lip) * 1000)
 
     return {
@@ -521,10 +862,31 @@ def lipsync_stream(req: StreamReq):
             )
         avatar_cache[req.avatar_key] = prepare_avatar(base64.b64decode(req.video_b64))
 
-    mp4 = run_lipsync(avatar_cache[req.avatar_key], base64.b64decode(req.audio_b64))
+    # Stream JPEG frames in the companion client's custom protocol:
+    #   [1 pad][float32 fps][uint32 total][per-frame: uint32 len][JPEG]
+    # This is what components/companion/companion-view.tsx expects. Frames
+    # are emitted as soon as they're blended, so first-frame is <1s even
+    # for longer utterances.
+    audio = base64.b64decode(req.audio_b64)
+    avatar = avatar_cache[req.avatar_key]
+
+    # Default to 12fps: Mac sustains ~22fps production, so a 12fps output
+    # leaves ~80% headroom — the client buffer never drains even across slow
+    # batches. 15fps was borderline (~46% headroom) and caused mid-playback
+    # stalls on occasional variance.
+    stream_fps = float(os.environ.get("MUSETALK_STREAM_FPS", "12"))
+
+    def _gen():
+        for chunk in stream_lipsync_frames(avatar, audio, render_fps=stream_fps):
+            yield chunk
+
     elapsed = round(time.time() - start, 3)
-    return Response(
-        content=mp4,
+    return StreamingResponse(
+        _gen(),
         media_type="application/octet-stream",
-        headers={"X-Timing": f"total_s={elapsed}"},
+        headers={
+            "Content-Encoding": "identity",
+            "Cache-Control": "no-cache, no-store",
+            "X-Timing": f"first_byte_s={elapsed}",
+        },
     )
